@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import List
 
 import torch
 from freetoken.distributed import get_tp_info
@@ -93,6 +94,8 @@ class LinearStatePool:
         # radix-tree-donated snapshots are all drawn from this single free-list, so memory
         # flows between them by demand. Unused by the op harness (which assigns slots by hand).
         self.padding_slot = 0
+        # verify batches only read the live state; Engine attaches this when a decode step has more than one row
+        self.verify_scratch: LinearVerifyScratch | None = None
         self._free_slots: list[int] = list(range(1, num_slots))
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
@@ -224,6 +227,14 @@ class LinearStatePool:
     def device(self) -> torch.device:
         return self._device
 
+    def attach_verify_scratch(self, max_bs: int, rows_per_req: int) -> None:
+        """Build the scratch for verify batches of up to ``max_bs`` requests with ``rows_per_req`` rows each; build_fla_metadata hands it to the GDN layers."""
+        self.verify_scratch = LinearVerifyScratch(self, max_bs, rows_per_req)
+
+    def commit_verify(self, slots: List[int], counts: List[int], rows: List[int]) -> None:
+        """Advance each live slot over its verify row's first ``counts`` tokens."""
+        self.verify_scratch.commit(self, slots, counts, rows)
+
     def bytes_per_slot(self) -> int:
         """Total state bytes for one request (all linear layers)."""
         per = (
@@ -233,6 +244,45 @@ class LinearStatePool:
         for t in self.slot_states.values():
             per += t[:, 0].numel() * t.element_size()
         return int(per)
+
+
+class LinearVerifyScratch:
+    """Per-row scratch of a GDN verify: each row's recurrence inputs and conv window, keyed by verify-batch row.
+
+    The verify leaves the live recurrent state untouched and rolls the live conv window as if every row were
+    accepted; ``commit`` replays the accepted rows into the recurrent state and restores the conv window that ends
+    at the last accepted row. Dense and indexed by batch row, never by pool slot.
+    """
+
+    def __init__(self, pool: LinearStatePool, max_bs: int, rows_per_req: int) -> None:
+        num_layers, _, hv, k_dim, v_dim = pool.recurrent_states.shape
+        _, _, conv_dim, km1 = pool.conv_states.shape
+        hk = (conv_dim - hv * v_dim) // (2 * k_dim)
+        device = pool.recurrent_states.device
+        rows = (num_layers, max_bs, rows_per_req)
+        f32 = dict(dtype=torch.float32, device=device)
+        self.stash = (
+            torch.zeros(*rows, hk, k_dim, **f32),
+            torch.zeros(*rows, hv, v_dim, **f32),
+            torch.zeros(*rows, hv, **f32),
+            torch.zeros(*rows, hv, **f32),
+        )
+        self.conv_window = torch.zeros((*rows, conv_dim, km1), dtype=pool.conv_states.dtype, device=device)
+
+    def input_stash(self, li: int) -> tuple:
+        return tuple(t[li] for t in self.stash)
+
+    def commit(self, pool: LinearStatePool, slots: List[int], counts: List[int], rows: List[int]) -> None:
+        """Advance each live slot over its row's first ``counts`` verified tokens (count >= 1)."""
+        from freetoken.kernel.fla import gdn_state_replay
+
+        if not slots:
+            return
+        meta = torch.tensor([rows, slots, counts], dtype=torch.int32, pin_memory=pool.recurrent_states.is_cuda)
+        meta = meta.to(pool.recurrent_states.device, non_blocking=True)
+        gdn_state_replay(pool.recurrent_states, self.stash, meta)
+        row_idx, slot_idx, count = meta.long()
+        pool.conv_states[:, slot_idx] = self.conv_window[:, row_idx, count - 1]
 
 
 def linear_state_bytes_per_req(
@@ -274,7 +324,20 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     per_req = linear_state_bytes_per_req(
         linear_group, config.tp_info.size, config.dtype, slot_states
     )
-    return per_req * slots
+    return per_req * slots + verify_scratch_bytes(config, getattr(config, "decode_rows_per_req", 1))
+
+
+def verify_scratch_bytes(config, rows_per_req: int) -> int:
+    """Bytes of the LinearVerifyScratch the engine builds for verify batches of ``rows_per_req`` rows per request (0 when it is 1)."""
+    group = config.model_config.linear_attention_group()
+    if group is None or rows_per_req <= 1:
+        return 0
+    n_layers, conv_dim, hv = _linear_local_dims(group, config.tp_info.size)
+    hk = (conv_dim - hv * group.value_head_dim) // (2 * group.key_head_dim)
+    rows = n_layers * config.max_running_req * rows_per_req
+    stash = rows * (hk * group.key_head_dim + hv * group.value_head_dim + 2 * hv) * 4
+    window = rows * conv_dim * (group.conv_kernel_dim - 1) * config.dtype.itemsize
+    return stash + window
 
 
 def _linear_pool_num_slots(config) -> int:

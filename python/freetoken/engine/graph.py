@@ -32,6 +32,8 @@ class GraphCaptureBuffer:
     # GDN query indptr = arange(bs+1) * rows_per_req; a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
     rows_per_req: int = 1
+    fla_has_initial_state: torch.Tensor | None = None
+    fla_scratch_rows: torch.Tensor | None = None
 
     @classmethod
     def init(cls, bs: int, device: torch.device, mrope: bool = False, rows_per_req: int = 1) -> GraphCaptureBuffer:
@@ -46,6 +48,8 @@ class GraphCaptureBuffer:
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_per_req,
             rows_per_req=rows_per_req,
+            fla_has_initial_state=torch.ones(bs, dtype=torch.bool, device=device),
+            fla_scratch_rows=torch.arange(bs, dtype=torch.int32, device=device),
         )
 
     def set_batch(self, batch: Batch) -> None:
@@ -63,6 +67,11 @@ class GraphCaptureBuffer:
         batch.fla_metadata = FLAMetadata(
             cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[:bs]
         )
+        if self.rows_per_req > 1:
+            # constants of a verify graph: every request continues its state, scratch row = batch row
+            batch.fla_metadata.has_initial_state = self.fla_has_initial_state[:bs]
+            batch.fla_metadata.intermediate_state_indices = self.fla_scratch_rows[:bs]
+            batch.fla_metadata.verify_scratch = getattr(get_global_ctx().linear_state_pool, "verify_scratch", None)
 
     def copy_from(self, batch: Batch) -> None:
         _rows = slice(batch.padded_size * self.rows_per_req)

@@ -7,6 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+    from freetoken.kvcache.linear_state_pool import LinearVerifyScratch
 
 
 @dataclass
@@ -21,7 +22,7 @@ class FLAMetadata:
       cu_seqlens          query indptr; decode = arange(bs+1) (1 token/req), prefill =
                           cumsum of extend_len. int32 on device.
       cache_indices       per-request recurrent/conv state slot (= Req.table_idx). int32.
-      has_initial_state   prefill only: whether each request continues a cached prefix
+      has_initial_state   prefill and verify: whether each request continues a cached prefix
                           (cached_len > 0). None for decode (state always present).
       fresh_state_indices prefill only: the state-pool slots whose sequence is fresh
                           (cached_len == 0) and must be zeroed before the chunk kernel
@@ -32,6 +33,10 @@ class FLAMetadata:
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor | None = None
     fresh_state_indices: torch.Tensor | None = None
+    # verify only: each request's row in the LinearVerifyScratch (int32; rows < 0 are skipped)
+    intermediate_state_indices: torch.Tensor | None = None
+    # verify only: the state pool's scratch the verify writes and the commit replays
+    verify_scratch: "LinearVerifyScratch | None" = None
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
@@ -69,6 +74,19 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
+
+    if getattr(batch, "phase", None) == "verify":
+        # every request continues its live state; scratch row = batch row
+        from freetoken.core import get_global_ctx
+
+        bs, rows_per_req = len(reqs), batch.rows_per_req
+        return FLAMetadata(
+            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_per_req,
+            cache_indices=torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin).to(device, non_blocking=True),
+            has_initial_state=torch.ones(bs, dtype=torch.bool, device=device),
+            intermediate_state_indices=torch.arange(bs, dtype=torch.int32, device=device),
+            verify_scratch=get_global_ctx().linear_state_pool.verify_scratch,
+        )
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
     lens = [r.extend_len for r in reqs]
